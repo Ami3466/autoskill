@@ -49,35 +49,69 @@ If the user says "scan project X", filter to that project's directory. Otherwise
 
 ### Step 2: Extract user prompts
 
-For each `.jsonl` file, extract entries where `type == "user"` and the message has plain user content (not tool results).
+For each `.jsonl` file, extract entries where `type == "user"` and the message has plain string content. Filter out system-injected noise (task notifications, tool results, system reminders).
 
-Use `jq` for speed:
+Write a temp extraction script and run it:
 
 ```bash
-# Extract all user prompts across all projects, with session ID
-for f in ~/.claude/projects/*/*.jsonl; do
-  jq -r 'select(.type == "user" and (.message.content | type == "string")) | "\(.sessionId)\t\(.cwd // "")\t\(.message.content)"' "$f" 2>/dev/null
-done > /tmp/autoskill-prompts.tsv
+cat > /tmp/autoskill-extract.sh << 'SCRIPT'
+#!/bin/bash
+set +e
+> /tmp/autoskill-prompts.jsonl
+while IFS= read -r f; do
+  jq -c '
+    select(.type == "user" and (.message.content | type == "string"))
+    | .message.content
+    | select(
+        (startswith("<task-notification>") | not) and
+        (startswith("<system-reminder>") | not) and
+        (startswith("<command-name>") | not) and
+        (startswith("<command-message>") | not) and
+        (startswith("<command-args>") | not) and
+        (startswith("<bash-input>") | not) and
+        (startswith("<bash-stdout>") | not) and
+        (startswith("<bash-stderr>") | not) and
+        (startswith("<local-command-stdout>") | not) and
+        (startswith("<local-command-caveat>") | not) and
+        (startswith("[Image:") | not) and
+        (startswith("Caveat: The messages") | not) and
+        (startswith("This session is being") | not) and
+        (startswith("[Request interrupted") | not) and
+        (length > 3)
+      )' "$f" 2>/dev/null >> /tmp/autoskill-prompts.jsonl
+done < /tmp/autoskill-recent-files.txt
+echo "extracted $(wc -l < /tmp/autoskill-prompts.jsonl) prompts"
+SCRIPT
+chmod +x /tmp/autoskill-extract.sh
+
+ls -t ~/.claude/projects/*/*.jsonl > /tmp/autoskill-recent-files.txt
+bash /tmp/autoskill-extract.sh
 ```
 
-Some user content is an array (tool_result blocks). Filter to string-only content - those are the real human prompts.
+Output is one JSON-encoded string per line in `/tmp/autoskill-prompts.jsonl`. Each line = one user prompt with newlines escaped (safe for line-by-line processing).
 
-If `/tmp/autoskill-prompts.tsv` is empty, fall back to:
-```bash
-jq -r 'select(.type == "user") | .message.content | if type == "string" then . else empty end' "$f"
-```
+**Important:** Many users run scheduled agents, cron jobs, or `/loop` commands. These produce pre-canned "user" messages that dominate the data. They ARE valid skill candidates (the canned prompt itself is the missing skill), but they're NOT correction/feedback signal for CLAUDE.md rules.
 
 ### Step 3: Sample for analysis
 
-Reading every prompt across hundreds of sessions blows the context window. Sample:
-
-- Take the most recent ~500 prompts (last 30 days is usually enough).
-- If a single prompt is over 2000 chars (a long instruction block), keep only the first 500 chars + last 200 chars - the middle is usually file content.
-- Dedupe exact duplicates before analysis (same prompt run 10 times = 1 entry with count).
+Reading every prompt across hundreds of sessions blows the context window. Sample and dedupe:
 
 ```bash
-head -500 /tmp/autoskill-prompts.tsv | sort | uniq -c | sort -rn | head -200 > /tmp/autoskill-sample.tsv
+# Top prompts by frequency (count + first 200 chars)
+sort /tmp/autoskill-prompts.jsonl | uniq -c | sort -rn | head -50 | \
+  awk '{n=$1; $1=""; sub(/^ */, ""); printf "%4d  %.200s\n", n, $0}' \
+  > /tmp/autoskill-top.txt
+
+# Short prompts (corrections/feedback signal) - under 120 chars, not greetings
+jq -r '. | select(length < 120)' /tmp/autoskill-prompts.jsonl | \
+  grep -viE '^(good morning|hello|hi|hey|ok|yes|no|thanks|y|n)$' | \
+  sort | uniq -c | sort -rn | head -50 \
+  > /tmp/autoskill-short.txt
 ```
+
+Read BOTH files. The top file surfaces workflow candidates. The short file surfaces correction/preference candidates that get lost in frequency counts dominated by automated agents.
+
+If a single prompt is over 2000 chars, keep only the first 500 chars + last 200 chars when reading - the middle is usually file content.
 
 ### Step 4: Cluster (this is the LLM step - YOU do it)
 
@@ -96,6 +130,11 @@ Short imperative statements about HOW to behave. Signals:
 - Style rules: "use X", "always Y", "prefer Z".
 - Tool restrictions: "don't run X", "never push without asking".
 - 2+ occurrences (lower bar than skills - rules are higher signal per occurrence).
+
+Also check: embedded instructions inside longer prompts that repeat across sessions. E.g. if every review prompt ends with "Do not edit code. Do not commit. Review only." - that's a rule the user enforces by hand and should be in CLAUDE.md instead.
+
+**Type C - Automated agent prompts (-> skill candidates, NOT rule candidates):**
+Pre-canned prompts from cron, /loop, or SDK invocations. These are the most repeated prompts but they're already fully formed instructions. Each unique template = a skill the user wrote inline instead of as a SKILL.md. Draft the skill from the template.
 
 Ignore one-off requests, debugging chatter, and project-specific data.
 
@@ -210,6 +249,8 @@ Don't auto-install anything. The user moves files manually - safer, and they get
 - **Quote evidence** - never paraphrase the user's words when justifying a rule. Verbatim or skip.
 - **Skip the obvious** - "user prefers concise responses" is not a useful rule. Look for non-default, surprising, project-shaping patterns.
 - **No hallucination** - if you can't find 3+ workflow occurrences or 2+ rule occurrences, don't draft. Empty output is fine.
+- **Distinguish automation from preference** - a prompt repeated 25 times by a cron job is a skill candidate (the cron prompt IS the skill). It is NOT evidence of a user preference. Only count interactive, human-typed messages as preference/correction signal.
+- **Check embedded rules** - long automated prompts often contain inline rules ("Do not commit", "Ignore Campaign type errors"). If the same inline rule appears across multiple different prompt templates, promote it to a CLAUDE.md suggestion.
 
 ---
 
