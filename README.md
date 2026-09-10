@@ -2,6 +2,14 @@
 
 A Claude Code skill that scans your transcripts and tells you which skills to create and what to add to your `CLAUDE.md`.
 
+## Quick start
+
+```bash
+git clone https://github.com/Ami3466/autoskill.git ~/.claude/skills/autoskill
+```
+
+Then run `/autoskill` in Claude Code. Skills in `~/.claude/skills/` are auto-discovered.
+
 ```
 autoskill scan complete.
 
@@ -21,14 +29,6 @@ CLAUDE.md rules to add: 7
 
 Drafts: ./autoskill-output/
 ```
-
-## Install
-
-```bash
-git clone https://github.com/Ami3466/autoskill.git ~/.claude/skills/autoskill
-```
-
-Claude Code auto-discovers skills in `~/.claude/skills/`.
 
 ## Usage
 
